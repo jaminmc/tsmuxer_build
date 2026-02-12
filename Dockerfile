@@ -112,7 +112,7 @@ RUN mkdir -p /usr/lib/x86_64-linux-gnu/qt6/plugins/mediaservice && \
 # Setup osxcross for macOS cross-compilation
 # ============================================================================
 ENV OSXCROSS_ROOT=/usr/lib/osxcross
-ENV MACOSX_DEPLOYMENT_TARGET=15.0
+ENV MACOSX_DEPLOYMENT_TARGET=11.0
 ENV UNATTENDED=1
 
 # Install osxcross build dependencies
@@ -170,10 +170,47 @@ RUN cd ${OSXCROSS_ROOT}-src && \
 
 ENV PATH=${OSXCROSS_ROOT}/bin:${OSXCROSS_ROOT}/tools:$PATH
 
-# Install macOS dependencies via osxcross-macports (if osxcross was built)
-RUN if [ -f ${OSXCROSS_ROOT}/bin/osxcross-macports ]; then \
-        ${OSXCROSS_ROOT}/bin/osxcross-macports install freetype && \
-        ${OSXCROSS_ROOT}/bin/osxcross-macports install zlib; \
+# Setup XAR for osxcross (required by the osxcross linker)
+# Must come before any cross-compilation steps that use the linker
+RUN git clone https://github.com/tpoechtrager/xar.git /tmp/xar && \
+    cd /tmp/xar/xar && \
+    ./autogen.sh --prefix=${OSXCROSS_ROOT} && \
+    make && make install && \
+    rm -rf /tmp/xar
+
+# Ensure the osxcross linker can find libxar at runtime
+ENV LD_LIBRARY_PATH=${OSXCROSS_ROOT}/lib:${LD_LIBRARY_PATH}
+
+# Build universal freetype from source for macOS cross-compilation
+# (MacPorts repos don't support darwin_25 yet, so we build from source)
+ENV FREETYPE_PREFIX=${OSXCROSS_ROOT}/freetype
+RUN if [ -f ${OSXCROSS_ROOT}/bin/oa64-clang ]; then \
+        FREETYPE_VER=2.13.3 && \
+        curl -sLo /tmp/freetype-${FREETYPE_VER}.tar.xz \
+          "https://download.savannah.gnu.org/releases/freetype/freetype-${FREETYPE_VER}.tar.xz" && \
+        cd /tmp && tar xf freetype-${FREETYPE_VER}.tar.xz && \
+        # Build for arm64
+        mkdir /tmp/ft-arm64 && cd /tmp/ft-arm64 && \
+        ${OSXCROSS_ROOT}/bin/arm64-apple-darwin*-cmake /tmp/freetype-${FREETYPE_VER} \
+          -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_HARFBUZZ=ON \
+          -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_PNG=ON -DFT_DISABLE_BZIP2=ON && \
+        make -j$(nproc) && \
+        # Build for x86_64
+        mkdir /tmp/ft-x86_64 && cd /tmp/ft-x86_64 && \
+        ${OSXCROSS_ROOT}/bin/x86_64-apple-darwin*-cmake /tmp/freetype-${FREETYPE_VER} \
+          -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_HARFBUZZ=ON \
+          -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_PNG=ON -DFT_DISABLE_BZIP2=ON && \
+        make -j$(nproc) && \
+        # Create universal static library
+        mkdir -p ${FREETYPE_PREFIX}/lib && \
+        ${OSXCROSS_ROOT}/bin/aarch64-apple-darwin*-lipo -create \
+          /tmp/ft-arm64/libfreetype.a /tmp/ft-x86_64/libfreetype.a \
+          -output ${FREETYPE_PREFIX}/lib/libfreetype.a && \
+        # Copy headers
+        cp -r /tmp/freetype-${FREETYPE_VER}/include ${FREETYPE_PREFIX}/ && \
+        cp /tmp/ft-arm64/include/freetype/config/ftconfig.h \
+          ${FREETYPE_PREFIX}/include/freetype/config/ && \
+        rm -rf /tmp/freetype-* /tmp/ft-arm64 /tmp/ft-x86_64; \
     fi
 
 # Install Qt for macOS cross-compilation (x86_64 and arm64 for universal binaries)
@@ -186,20 +223,6 @@ RUN if [ -f ${OSXCROSS_ROOT}/bin/o64-clang ]; then \
 
 ENV QT_MAC_X64=${QT_MAC_PATH}/${QT_VERSION}/macos
 
-# Setup XAR for osxcross (required for code signing)
-RUN git clone https://github.com/tpoechtrager/xar.git /tmp/xar && \
-    cd /tmp/xar/xar && \
-    ./autogen.sh --prefix=${OSXCROSS_ROOT} && \
-    make && make install && \
-    rm -rf /tmp/xar
-
-# Create static library symlinks for osxcross (if macports packages were installed)
-RUN if [ -d ${OSXCROSS_ROOT}/macports/pkgs/opt/local/lib ]; then \
-        cd ${OSXCROSS_ROOT}/macports/pkgs/opt/local/lib && \
-        for lib in libfreetype.a libz.a libbz2.a libpng.a libpng16.a; do \
-            [ -f "$lib" ] && ln -sf "$lib" "${lib%.a}-static.a" || true; \
-        done; \
-    fi
 
 # ============================================================================
 # Setup MXE for Windows cross-compilation
@@ -228,21 +251,27 @@ RUN apt-get update && apt-get install -y \
 # Clone MXE repository
 RUN git clone https://github.com/mxe/mxe.git ${MXE_ROOT}
 
+# Free up space before the large MXE build
+RUN rm -rf /tmp/* /var/tmp/* /var/lib/apt/lists/* && \
+    rm -rf ${OSXCROSS_ROOT}-src 2>/dev/null || true
+
 # Build MXE toolchain and base libraries first
 # This takes a long time on first build
 WORKDIR ${MXE_ROOT}
 RUN make MXE_TARGETS="${MXE_TARGETS}" \
     MXE_PLUGIN_DIRS="plugins/gcc14" \
-    cc cmake freetype zlib
+    cc cmake freetype zlib && \
+    rm -rf ${MXE_ROOT}/tmp-* ${MXE_ROOT}/log/* ${MXE_ROOT}/pkg/.tmp-*
 
-# Build MXE Qt6 separately - dump log on failure for debugging
+# Build MXE Qt6 separately - clean temp dirs after each step to save space
 RUN LD_LIBRARY_PATH= make MXE_TARGETS="${MXE_TARGETS}" \
     MXE_PLUGIN_DIRS="plugins/gcc14" \
     qt6-qtbase qt6-qttools qt6-qtmultimedia \
     || (echo "=== BUILD FAILED ===" && \
         for f in ${MXE_ROOT}/log/qt6-qtbase*; do \
             echo "=== $f ===" && tail -200 "$f" 2>/dev/null; \
-        done && false)
+        done && false) && \
+    rm -rf ${MXE_ROOT}/tmp-* ${MXE_ROOT}/log/* ${MXE_ROOT}/pkg/.tmp-* /tmp/*
 
 # Add MXE to PATH
 ENV PATH=${MXE_ROOT}/usr/bin:$PATH
